@@ -19,7 +19,7 @@ from aead_icmp import AEADICMPSocket, ICMP_ECHO_REPLY, normalize_cipher_name
 HELLO_PREFIX = b"IDTS-KEX1\0"
 SESSION_PREFIX = b"IDTS-SESSION1\0"
 VIDEO_USER_AGENT = "IDTS Video Mode"
-DEFAULT_IDTS_DATA_PAYLOAD = 900
+DEFAULT_IDTS_DATA_PAYLOAD = 198
 
 
 @dataclass
@@ -128,7 +128,7 @@ def main() -> None:
     )
     ap.add_argument("--window", type=int, default=512)
     ap.add_argument("--rto", type=float, default=0.25)
-    ap.add_argument("--max-data-payload", type=int, default=DEFAULT_IDTS_DATA_PAYLOAD, help="Per-packet IDTS data payload size; smaller values are safer for ICMP paths")
+    ap.add_argument("--max-data-payload", type=int, default=DEFAULT_IDTS_DATA_PAYLOAD, help="Per-packet IDTS data payload size; keep this small for ICMP paths (default: 198)")
     ap.add_argument("--loss", type=int, default=0, help="Simulated outbound packet loss percent (0-100)")
     ap.add_argument("--congestion-control", action="store_true", help="Enable optional AIMD congestion control")
     ap.add_argument("--burst-limit", type=int, default=6, help="Max packets sent per flush cycle")

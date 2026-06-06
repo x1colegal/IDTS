@@ -1,3 +1,4 @@
+import ctypes
 import hashlib
 import os
 import socket
@@ -14,6 +15,18 @@ ICMP_ECHO_REQUEST = 8
 ICMP_CODE = 0
 ICMP_HEADER_FMT = "!BBHHH"
 ICMP_HEADER_SIZE = struct.calcsize(ICMP_HEADER_FMT)
+
+SO_ATTACH_FILTER = getattr(socket, "SO_ATTACH_FILTER", 26)
+SOL_RAW = getattr(socket, "SOL_RAW", 255)
+ICMP_FILTER = 1
+
+
+class SockFilter(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_ushort), ("jt", ctypes.c_ubyte), ("jf", ctypes.c_ubyte), ("k", ctypes.c_uint32)]
+
+
+class SockFprog(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.POINTER(SockFilter))]
 
 
 def normalize_cipher_name(name: str) -> str:
@@ -88,8 +101,48 @@ class AEADICMPSocket:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
         except OSError:
             pass
+        self._install_filters()
         if addr[1]:
             self.icmp_id = addr[1] & 0xFFFF
+
+    def _install_filters(self):
+        self._install_icmp_filter()
+        self._install_bpf_filter()
+
+    def _install_icmp_filter(self):
+        # Raw ICMP sockets still see a lot of unrelated traffic on busy hosts.
+        # Filter out everything except echo request/reply as early as possible.
+        try:
+            allowed_mask = (1 << ICMP_ECHO_REQUEST) | (1 << ICMP_ECHO_REPLY)
+            block_mask = (~allowed_mask) & 0xFFFFFFFF
+            self.sock.setsockopt(SOL_RAW, ICMP_FILTER, struct.pack('I', block_mask))
+        except OSError:
+            pass
+        except AttributeError:
+            pass
+
+    def _install_bpf_filter(self):
+        # Classic BPF: accept only ICMP echo request/reply. This reduces userspace
+        # wakeups on noisy hosts while keeping the transport raw-ICMP based.
+        try:
+            extended = (SockFilter * 8)(
+                SockFilter(0x30, 0, 0, 0),                    # ld  b [0]   -> IP version/IHL
+                SockFilter(0x54, 0, 0, 0x0F),                 # and #0x0f   -> IHL in 32-bit words
+                SockFilter(0x64, 0, 0, 2),                    # lsh #2      -> IHL bytes
+                SockFilter(0x50, 0, 0, 0),                    # ldb [x+0]   -> ICMP type
+                SockFilter(0x15, 1, 0, ICMP_ECHO_REQUEST),    # if echo-request -> accept
+                SockFilter(0x15, 0, 1, ICMP_ECHO_REPLY),      # if echo-reply   -> accept else drop
+                SockFilter(0x06, 0, 0, 0x00040000),           # ret #262144
+                SockFilter(0x06, 0, 0, 0),                    # ret #0
+            )
+            prog = SockFprog(len=8, filter=ctypes.cast(extended, ctypes.POINTER(SockFilter)))
+            self._bpf_program = extended
+            self._bpf_prog = prog
+            self.sock.setsockopt(socket.SOL_SOCKET, SO_ATTACH_FILTER, bytes(prog))
+        except OSError:
+            pass
+        except AttributeError:
+            pass
 
     def _make_packet(self, icmp_type: int, ident: int, payload: bytes) -> bytes:
         seq = self._icmp_seq & 0xFFFF
