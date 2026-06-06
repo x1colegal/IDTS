@@ -194,77 +194,78 @@ def main() -> None:
         nonlocal next_out_pos, last_gap_log, last_rx_ts, last_valid_data_ts, session_ready
         while running:
             try:
-                raw, addr = usock.recvfrom(65535)
+                packets = usock.recvfrom_many(16, 65535) if hasattr(usock, "recvfrom_many") else [usock.recvfrom(65535)]
             except Exception:
                 continue
-            if addr[0] != resolved_peer_ip:
-                continue
-            pkt = parse_packet(raw)
-            if not pkt:
-                continue
-            last_rx_ts = time.time()
-            if pkt.pkt_type == TYPE_HELLO and pkt.payload.startswith(SESSION_PREFIX):
-                rest = pkt.payload[len(SESSION_PREFIX) :]
-                if len(rest) >= 64:
-                    echoed_client_pub = rest[:32]
-                    server_pub = rest[32:64]
-                    session_cipher = rest[64:].decode("ascii", "replace") or selected_cipher
-                    with key_lock:
-                        if echoed_client_pub != client_pub:
+            for raw, addr in packets:
+                if addr[0] != resolved_peer_ip:
+                    continue
+                pkt = parse_packet(raw)
+                if not pkt:
+                    continue
+                last_rx_ts = time.time()
+                if pkt.pkt_type == TYPE_HELLO and pkt.payload.startswith(SESSION_PREFIX):
+                    rest = pkt.payload[len(SESSION_PREFIX) :]
+                    if len(rest) >= 64:
+                        echoed_client_pub = rest[:32]
+                        server_pub = rest[32:64]
+                        session_cipher = rest[64:].decode("ascii", "replace") or selected_cipher
+                        with key_lock:
+                            if echoed_client_pub != client_pub:
+                                if running:
+                                    print("[IDTS-CLIENT] ignored stale session response")
+                                continue
+                            if session_cipher != selected_cipher:
+                                raise SystemExit(
+                                    f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}"
+                                )
+                            check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
+                            server_public = x25519.X25519PublicKey.from_public_bytes(server_pub)
+                            session_key = derive_session_key(client_private.exchange(server_public), client_pub, server_pub)
+                        usock.set_peer_psk(peer, session_key, session_cipher)
+                        session_ready = True
+                        last_valid_data_ts = time.time()
+                        if running:
+                            print(f"[IDTS-CLIENT] session aead cipher={session_cipher}")
+                    continue
+                if pkt.pkt_type == TYPE_CLOSE:
+                    continue
+                if pkt.pkt_type != TYPE_DATA:
+                    continue
+
+                last_valid_data_ts = time.time()
+                recv.handle_data(pkt)
+                if args.output_mode == "udp" and args.udp_unordered_live:
+                    output_send(pkt.payload)
+
+                with reorder_lock:
+                    out_by_pos[pkt.stream_pos] = pkt.payload
+                    while next_out_pos in out_by_pos:
+                        if args.output_mode == "tcp" and time.time() < ordered_release_at:
+                            break
+                        if args.output_mode == "udp" and not args.udp_unordered_live and time.time() < ordered_release_at:
+                            break
+                        chunk = out_by_pos.pop(next_out_pos)
+                        if args.output_mode == "tcp" or (args.output_mode == "udp" and not args.udp_unordered_live):
+                            output_send(chunk)
+                        next_out_pos += len(chunk)
+
+                    if pkt.stream_pos > next_out_pos:
+                        now = time.time()
+                        if now - last_gap_log >= 0.25:
                             if running:
-                                print("[IDTS-CLIENT] ignored stale session response")
-                            continue
-                        if session_cipher != selected_cipher:
-                            raise SystemExit(
-                                f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}"
-                            )
-                        check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
-                        server_public = x25519.X25519PublicKey.from_public_bytes(server_pub)
-                        session_key = derive_session_key(client_private.exchange(server_public), client_pub, server_pub)
-                    usock.set_peer_psk(peer, session_key, session_cipher)
-                    session_ready = True
-                    last_valid_data_ts = time.time()
-                    if running:
-                        print(f"[IDTS-CLIENT] session aead cipher={session_cipher}")
-                continue
-            if pkt.pkt_type == TYPE_CLOSE:
-                continue
-            if pkt.pkt_type != TYPE_DATA:
-                continue
-
-            last_valid_data_ts = time.time()
-            recv.handle_data(pkt)
-            if args.output_mode == "udp" and args.udp_unordered_live:
-                output_send(pkt.payload)
-
-            with reorder_lock:
-                out_by_pos[pkt.stream_pos] = pkt.payload
-                while next_out_pos in out_by_pos:
-                    if args.output_mode == "tcp" and time.time() < ordered_release_at:
-                        break
-                    if args.output_mode == "udp" and not args.udp_unordered_live and time.time() < ordered_release_at:
-                        break
-                    chunk = out_by_pos.pop(next_out_pos)
-                    if args.output_mode == "tcp" or (args.output_mode == "udp" and not args.udp_unordered_live):
-                        output_send(chunk)
-                    next_out_pos += len(chunk)
-
-                if pkt.stream_pos > next_out_pos:
-                    now = time.time()
-                    if now - last_gap_log >= 0.25:
+                                print(
+                                    f"[IDTS-CLIENT] GAP next_pos={next_out_pos} "
+                                    f"arrived_pos={pkt.stream_pos} seq={pkt.seq} "
+                                    f"reorder_q={len(out_by_pos)}"
+                                )
+                            last_gap_log = now
+                    elif pkt.stream_pos < next_out_pos:
                         if running:
                             print(
-                                f"[IDTS-CLIENT] GAP next_pos={next_out_pos} "
-                                f"arrived_pos={pkt.stream_pos} seq={pkt.seq} "
-                                f"reorder_q={len(out_by_pos)}"
+                                f"[IDTS-CLIENT] RECOVERY seq={pkt.seq} pos={pkt.stream_pos} "
+                                f"reconstructed_until={next_out_pos}"
                             )
-                        last_gap_log = now
-                elif pkt.stream_pos < next_out_pos:
-                    if running:
-                        print(
-                            f"[IDTS-CLIENT] RECOVERY seq={pkt.seq} pos={pkt.stream_pos} "
-                            f"reconstructed_until={next_out_pos}"
-                        )
 
     if args.output_mode == "tcp":
         threads.append(threading.Thread(target=accept_loop, daemon=True, name="idts-accept"))

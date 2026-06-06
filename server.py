@@ -19,6 +19,7 @@ from aead_icmp import AEADICMPSocket, ICMP_ECHO_REPLY, normalize_cipher_name
 HELLO_PREFIX = b"IDTS-KEX1\0"
 SESSION_PREFIX = b"IDTS-SESSION1\0"
 VIDEO_USER_AGENT = "IDTS Video Mode"
+DEFAULT_IDTS_DATA_PAYLOAD = 900
 
 
 @dataclass
@@ -127,6 +128,7 @@ def main() -> None:
     )
     ap.add_argument("--window", type=int, default=512)
     ap.add_argument("--rto", type=float, default=0.25)
+    ap.add_argument("--max-data-payload", type=int, default=DEFAULT_IDTS_DATA_PAYLOAD, help="Per-packet IDTS data payload size; smaller values are safer for ICMP paths")
     ap.add_argument("--loss", type=int, default=0, help="Simulated outbound packet loss percent (0-100)")
     ap.add_argument("--congestion-control", action="store_true", help="Enable optional AIMD congestion control")
     ap.add_argument("--burst-limit", type=int, default=6, help="Max packets sent per flush cycle")
@@ -211,64 +213,65 @@ def main() -> None:
         nonlocal running
         while running:
             try:
-                raw, addr = sock.recvfrom(65535)
+                packets = sock.recvfrom_many(16, 65535) if hasattr(sock, "recvfrom_many") else [sock.recvfrom(65535)]
             except Exception:
                 continue
 
-            try:
-                pkt = parse_packet(raw)
-                if not pkt:
-                    continue
-                if args.peer_id and addr[1] != args.peer_id:
-                    continue
-                session = None
-                create_pub = None
-                now = time.time()
+            for raw, addr in packets:
+                try:
+                    pkt = parse_packet(raw)
+                    if not pkt:
+                        continue
+                    if args.peer_id and addr[1] != args.peer_id:
+                        continue
+                    session = None
+                    create_pub = None
+                    now = time.time()
 
-                with sessions_lock:
-                    session = sessions.get(addr)
-                    if pkt.pkt_type == TYPE_HELLO:
-                        parsed = parse_client_hello(pkt.payload)
-                        if parsed is not None:
-                            client_pub, requested_cipher = parsed
-                            if session is not None:
-                                session.last_hello_ts = now
-                                if client_pub == session.client_pub:
-                                    pass
-                                else:
-                                    create_pub = (client_pub, requested_cipher)
-                            else:
-                                old_addr, old_session = find_session_by_client_pub(client_pub)
-                                if old_session is not None:
-                                    migrate_session(old_addr, addr, old_session)
-                                    session = old_session
-                                    session.last_hello_ts = now
-                                    session.last_seen_ts = now
-                                else:
-                                    create_pub = (client_pub, requested_cipher)
-                        elif session is not None:
-                            session.last_hello_ts = now
-                            session.last_seen_ts = now
-                    elif session is not None:
-                        session.last_seen_ts = now
-
-                if create_pub is not None:
-                    new = new_session(addr, create_pub[0], create_pub[1])
                     with sessions_lock:
-                        old = sessions.get(addr)
-                        if old is not None:
-                            old.sender.stop()
-                            sock.clear_peer(addr)
-                        sessions[addr] = new
-                    continue
+                        session = sessions.get(addr)
+                        if pkt.pkt_type == TYPE_HELLO:
+                            parsed = parse_client_hello(pkt.payload)
+                            if parsed is not None:
+                                client_pub, requested_cipher = parsed
+                                if session is not None:
+                                    session.last_hello_ts = now
+                                    if client_pub == session.client_pub:
+                                        pass
+                                    else:
+                                        create_pub = (client_pub, requested_cipher)
+                                else:
+                                    old_addr, old_session = find_session_by_client_pub(client_pub)
+                                    if old_session is not None:
+                                        migrate_session(old_addr, addr, old_session)
+                                        session = old_session
+                                        session.last_hello_ts = now
+                                        session.last_seen_ts = now
+                                    else:
+                                        create_pub = (client_pub, requested_cipher)
+                            elif session is not None:
+                                session.last_hello_ts = now
+                                session.last_seen_ts = now
+                        elif session is not None:
+                            session.last_seen_ts = now
 
-                if session is None:
-                    continue
-                if pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST, TYPE_HELLO):
-                    session.sender.on_control(pkt)
-            except Exception:
-                print("[IDTS-SERVER] control-loop error:")
-                traceback.print_exc()
+                    if create_pub is not None:
+                        new = new_session(addr, create_pub[0], create_pub[1])
+                        with sessions_lock:
+                            old = sessions.get(addr)
+                            if old is not None:
+                                old.sender.stop()
+                                sock.clear_peer(addr)
+                            sessions[addr] = new
+                        continue
+
+                    if session is None:
+                        continue
+                    if pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST, TYPE_HELLO):
+                        session.sender.on_control(pkt)
+                except Exception:
+                    print("[IDTS-SERVER] control-loop error:")
+                    traceback.print_exc()
 
     threading.Thread(target=ctrl_loop, daemon=True).start()
 
@@ -305,7 +308,7 @@ def main() -> None:
                 time.sleep(0.2)
                 continue
 
-            chunk = proc.stdout.read(MAX_PAYLOAD)
+            chunk = proc.stdout.read(max(256, min(MAX_PAYLOAD, args.max_data_payload)))
             if not chunk:
                 try:
                     proc.terminate()

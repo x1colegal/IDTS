@@ -61,12 +61,17 @@ Because of that, `IDTS` can be:
 
 If the network rate-limits ICMP aggressively, speeds can become extremely low even when the same path performs well with UDP.
 
+Another practical issue:
+- larger ICMP payloads are much more likely to be fragmented, filtered, or silently dropped on real paths
+- because of that, IDTS intentionally benefits from smaller per-packet payload sizes than the UDP-based USTPS defaults
+
 ## ICMP tuning defaults
 The current defaults are intentionally conservative to reduce ICMP burstiness:
 - client keepalive is slower than the UDP-based USTPS defaults
 - sender pacing is enabled
 - send bursts are smaller
 - outbound queues are bounded more aggressively
+- receive loops now drain packets in small batches instead of handling only one packet per wake-up
 
 This is not because ICMP is inherently better at low speed, but because many real networks penalize bursty ICMP much more aggressively than bursty UDP.
 
@@ -99,6 +104,7 @@ python3 server.py \
   --bind-ip 0.0.0.0 \
   --bind-id 0 \
   --video "<HLS_URL_OR_LOCAL_FILE>" \
+  --max-data-payload 900 \
   --cipher chacha20
 ```
 
@@ -112,9 +118,19 @@ python3 server.py \
   --bind-ip 0.0.0.0 \
   --bind-id 0 \
   --video "<HLS_URL_OR_LOCAL_FILE>" \
+  --max-data-payload 900 \
   --video-parameters "-c:v libx264 -preset veryfast -b:v 2500k -c:a aac -b:a 128k -mpegts_flags +resend_headers" \
   --cipher chacha20
 ```
+
+## About `--max-data-payload`
+- default: `900`
+- smaller payloads are usually safer for ICMP than trying to push near-MTU packets
+- if the client is not receiving data while the server keeps hitting RTO, reducing `--max-data-payload` is one of the first things to try
+- example safer values:
+  - `900`
+  - `800`
+  - `700`
 
 ## Client example
 ```bash

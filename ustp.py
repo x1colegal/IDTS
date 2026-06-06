@@ -109,25 +109,30 @@ class USTPSender:
     def flush(self) -> None:
         burst = 0
         while burst < self.burst_limit:
+            batch_raws: list[bytes] = []
             with self.lock:
-                in_flight = len(self.sent)
-                eff_window = self.window
-                if self.congestion_control:
-                    eff_window = max(1, min(self.window, int(self.cwnd)))
-                if in_flight >= eff_window:
-                    return
+                while burst + len(batch_raws) < self.burst_limit:
+                    in_flight = len(self.sent)
+                    eff_window = self.window
+                    if self.congestion_control:
+                        eff_window = max(1, min(self.window, int(self.cwnd)))
+                    if in_flight >= eff_window:
+                        break
 
-                # retransmit priority (can send 5,6,4,7,8 physically)
-                seq = None
-                if self.retx_queue:
-                    seq = self.retx_queue.popleft()
-                    self.retx_set.discard(seq)
-                    it = self.sent.get(seq)
-                    if not it:
+                    if self.retx_queue:
+                        seq = self.retx_queue.popleft()
+                        self.retx_set.discard(seq)
+                        it = self.sent.get(seq)
+                        if not it:
+                            continue
+                        raw = it.raw
+                        it.last_sent = time.time()
+                        batch_raws.append(raw)
                         continue
-                    raw = it.raw
-                    it.last_sent = time.time()
-                elif self.pending:
+
+                    if not self.pending:
+                        break
+
                     payload, ext_stream_pos = self.pending.popleft()
                     seq = self.next_seq
                     self.next_seq += 1
@@ -139,14 +144,23 @@ class USTPSender:
                     pkt = mkp(TYPE_DATA, seq=seq, stream_pos=sp, payload=payload)
                     raw = pkt.to_bytes()
                     self.sent[seq] = SentItem(pkt=pkt, raw=raw, last_sent=time.time())
-                else:
-                    return
+                    batch_raws.append(raw)
 
-            self._send_raw(raw)
+            if not batch_raws:
+                return
+
+            if hasattr(self.sock, "sendto_many"):
+                self.sock.sendto_many(batch_raws, self.peer)
+            else:
+                for raw in batch_raws:
+                    self._send_raw(raw)
+                    if self.pacing_interval > 0.0:
+                        time.sleep(self.pacing_interval)
+
             now = time.time()
             with self.lock:
                 self.last_send_ts = now
-            burst += 1
+            burst += len(batch_raws)
             if self.pacing_interval > 0.0 and burst < self.burst_limit:
                 time.sleep(self.pacing_interval)
 

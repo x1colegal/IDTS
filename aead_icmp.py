@@ -83,6 +83,11 @@ class AEADICMPSocket:
             self.sock.bind((addr[0], 0))
         except OSError:
             pass
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        except OSError:
+            pass
         if addr[1]:
             self.icmp_id = addr[1] & 0xFFFF
 
@@ -120,6 +125,15 @@ class AEADICMPSocket:
         pkt = self._make_packet(self.icmp_type, ident, payload)
         return self.sock.sendto(pkt, (addr[0], 0))
 
+    def sendto_many(self, packets: list[bytes], addr: Tuple[str, int]):
+        if not packets:
+            return 0
+        sent = 0
+        for data in packets:
+            self.sendto(data, addr)
+            sent += 1
+        return sent
+
     def send_plain(self, data: bytes, addr: Tuple[str, int]):
         ident = addr[1] & 0xFFFF
         pkt = self._make_packet(self.icmp_type, ident, data)
@@ -150,30 +164,58 @@ class AEADICMPSocket:
     def recvfrom(self, bufsize: int):
         while True:
             raw, addr = self.sock.recvfrom(max(bufsize, 65535))
-            parsed = self._parse_icmp(raw)
-            if parsed is None:
-                continue
-            _icmp_type, ident, payload = parsed
-            peer = (addr[0], ident)
-            if payload[:4] == b"IDT1":
-                return payload, peer
-            if len(payload) < 4 + 1 + 12 + 16:
-                continue
-            if payload[:4] != MAGIC:
-                continue
-            cid = payload[4]
-            nonce = payload[5:17]
-            ct = payload[17:]
-            peer_aeads = self._peer_aeads.get(peer)
-            aead_sets = [peer_aeads] if peer_aeads is not None else [self._aead_by_id]
-            for aead_by_id in aead_sets:
-                aead = aead_by_id.get(cid)
-                if aead is None:
-                    continue
+            parsed = self._decode_message(raw, addr)
+            if parsed is not None:
+                return parsed
+
+    def recvfrom_many(self, max_messages: int, bufsize: int):
+        out = []
+        try:
+            first = self.recvfrom(bufsize)
+        except Exception:
+            return out
+        out.append(first)
+        old_timeout = self.sock.gettimeout()
+        try:
+            self.sock.settimeout(0.0)
+            while len(out) < max_messages:
                 try:
-                    return aead.decrypt(nonce, ct, None), peer
-                except Exception:
-                    pass
+                    raw, addr = self.sock.recvfrom(max(bufsize, 65535))
+                except (BlockingIOError, InterruptedError, TimeoutError, socket.timeout):
+                    break
+                parsed = self._decode_message(raw, addr)
+                if parsed is not None:
+                    out.append(parsed)
+        finally:
+            self.sock.settimeout(old_timeout)
+        return out
+
+    def _decode_message(self, raw: bytes, addr: Tuple[str, int]):
+        parsed = self._parse_icmp(raw)
+        if parsed is None:
+            return None
+        _icmp_type, ident, payload = parsed
+        peer = (addr[0], ident)
+        if payload[:4] == b"IDT1":
+            return payload, peer
+        if len(payload) < 4 + 1 + 12 + 16:
+            return None
+        if payload[:4] != MAGIC:
+            return None
+        cid = payload[4]
+        nonce = payload[5:17]
+        ct = payload[17:]
+        peer_aeads = self._peer_aeads.get(peer)
+        aead_sets = [peer_aeads] if peer_aeads is not None else [self._aead_by_id]
+        for aead_by_id in aead_sets:
+            aead = aead_by_id.get(cid)
+            if aead is None:
+                continue
+            try:
+                return aead.decrypt(nonce, ct, None), peer
+            except Exception:
+                pass
+        return None
 
     def setsockopt(self, *args, **kwargs):
         return self.sock.setsockopt(*args, **kwargs)
