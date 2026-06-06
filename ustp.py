@@ -3,7 +3,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Optional, Set, Tuple
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 from packet import MAX_PAYLOAD, TYPE_ACK, TYPE_CLOSE, TYPE_DATA, TYPE_HELLO, TYPE_RETRANSMIT_REQUEST, USTPPacket, mkp
 
@@ -251,6 +251,8 @@ class USTPReceiver:
         self.contiguous_max_pos = -1
 
         self.received_seq: Set[int] = set()
+        self.pending_acks: Deque[int] = deque()
+        self.pending_ack_set: Set[int] = set()
         self.nack_ts: Dict[int, float] = {}
         self.last_data_ts = 0.0
         self.data_count = 0
@@ -278,11 +280,12 @@ class USTPReceiver:
         seq = pkt.seq
         pos = pkt.stream_pos
 
-        # ACK every unique seq quickly
+        # Queue ACKs and flush them in small batches to reduce ICMP control chatter.
         if seq not in self.received_seq:
             self.received_seq.add(seq)
-            ack = mkp(TYPE_ACK, seq=seq)
-            self.sock.sendto(ack.to_bytes(), self.peer)
+            if seq not in self.pending_ack_set:
+                self.pending_acks.append(seq)
+                self.pending_ack_set.add(seq)
 
         if seq in self.seq_to_pos:
             return b""
@@ -309,6 +312,23 @@ class USTPReceiver:
 
         return out
 
+    def flush_acks(self, limit: int = 16) -> int:
+        batch: List[bytes] = []
+        sent = 0
+        while self.pending_acks and sent < limit:
+            seq = self.pending_acks.popleft()
+            self.pending_ack_set.discard(seq)
+            batch.append(mkp(TYPE_ACK, seq=seq).to_bytes())
+            sent += 1
+        if not batch:
+            return 0
+        if hasattr(self.sock, "sendto_many"):
+            self.sock.sendto_many(batch, self.peer)
+        else:
+            for raw in batch:
+                self.sock.sendto(raw, self.peer)
+        return sent
+
     def maybe_nack(self) -> None:
         # gap detection by seq continuity around observed set
         if not self.received_seq:
@@ -320,6 +340,8 @@ class USTPReceiver:
         # Do not spam NACK when stream is idle/restarting.
         if self.last_data_ts and (now - self.last_data_ts) > 1.0:
             self.received_seq.clear()
+            self.pending_acks.clear()
+            self.pending_ack_set.clear()
             self.nack_ts.clear()
             self.seq_to_pos.clear()
             self.buffer_by_pos.clear()
@@ -336,14 +358,14 @@ class USTPReceiver:
             if s in self.received_seq:
                 continue
             last = self.nack_ts.get(s, 0.0)
-            if now - last < 0.5:
+            if now - last < 0.9:
                 continue
             self.nack_ts[s] = now
             nack = mkp(TYPE_RETRANSMIT_REQUEST, seq=s)
             self.sock.sendto(nack.to_bytes(), self.peer)
             print(f"[USTP-RECV] missing seq={s}, requesting retransmit")
             sent += 1
-            if sent >= 6:
+            if sent >= 3:
                 break
         if sent:
             print(f"[USTP-RECV] NACK sent={sent}")

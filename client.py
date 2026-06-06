@@ -187,8 +187,9 @@ def main() -> None:
     def nack_loop() -> None:
         while running:
             if session_ready:
+                recv.flush_acks(24)
                 recv.maybe_nack()
-            time.sleep(0.08)
+            time.sleep(0.12)
 
     def recv_loop() -> None:
         nonlocal next_out_pos, last_gap_log, last_rx_ts, last_valid_data_ts, session_ready
@@ -266,6 +267,8 @@ def main() -> None:
                                 f"[IDTS-CLIENT] RECOVERY seq={pkt.seq} pos={pkt.stream_pos} "
                                 f"reconstructed_until={next_out_pos}"
                             )
+            if session_ready:
+                recv.flush_acks(24)
 
     if args.output_mode == "tcp":
         threads.append(threading.Thread(target=accept_loop, daemon=True, name="idts-accept"))
