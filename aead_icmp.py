@@ -55,7 +55,7 @@ def _checksum(data: bytes) -> int:
 
 
 class AEADICMPSocket:
-    def __init__(self, sock: socket.socket, psk: str | bytes | None = None, cipher_name: str = "chacha20", icmp_type: int = ICMP_ECHO_REQUEST, icmp_id: int | None = None):
+    def __init__(self, sock: socket.socket, psk: str | bytes | None = None, cipher_name: str = "chacha20", icmp_type: int = ICMP_ECHO_REQUEST, icmp_id: int | None = None, enable_bpf: bool = True):
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 
         self.sock = sock
@@ -89,6 +89,7 @@ class AEADICMPSocket:
         self._peer_cipher: dict[Tuple[str, int], int] = {}
         self._peer_aeads: dict[Tuple[str, int], dict[int, object]] = {}
         self._local_ip = "0.0.0.0"
+        self.enable_bpf = enable_bpf
 
     def bind(self, addr: Tuple[str, int]):
         self._local_ip = addr[0]
@@ -107,7 +108,8 @@ class AEADICMPSocket:
 
     def _install_filters(self):
         self._install_icmp_filter()
-        self._install_bpf_filter()
+        if self.enable_bpf:
+            self._install_bpf_filter()
 
     def _install_icmp_filter(self):
         # Raw ICMP sockets still see a lot of unrelated traffic on busy hosts.

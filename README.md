@@ -104,7 +104,7 @@ python3 server.py \
   --bind-ip 0.0.0.0 \
   --bind-id 0 \
   --video "<HLS_URL_OR_LOCAL_FILE>" \
-  --max-data-payload 198 \
+  --max-data-payload 512 \
   --cipher chacha20
 ```
 
@@ -118,24 +118,25 @@ python3 server.py \
   --bind-ip 0.0.0.0 \
   --bind-id 0 \
   --video "<HLS_URL_OR_LOCAL_FILE>" \
-  --max-data-payload 198 \
+  --max-data-payload 512 \
   --video-parameters "-c:v libx264 -preset veryfast -b:v 2500k -c:a aac -b:a 128k -mpegts_flags +resend_headers" \
   --cipher chacha20
 ```
 
 ## About `--max-data-payload`
-- default: `198`
+- default: `512`
 - smaller payloads are usually safer for ICMP than trying to push near-MTU packets
 - if the client is not receiving data while the server keeps hitting RTO, reducing `--max-data-payload` is one of the first things to try
-- example safer values:
-  - `198`
-  - `160`
-  - `128`
+- useful profiles:
+  - `198` = safe mode
+  - `512` = balanced mode (default)
+  - `600` = aggressive mode
 
 ## ICMP socket path
 - transport stays on **raw ICMP**
 - small send/receive batches are used to reduce syscall overhead
 - Linux socket filters are enabled in Python when available so the raw socket wakes userspace less often on unrelated ICMP traffic
+- use `--no-bpf` if you want to test the raw ICMP path without the optional classic BPF filter
 
 ## Client example
 ```bash

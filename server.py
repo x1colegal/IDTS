@@ -19,7 +19,7 @@ from aead_icmp import AEADICMPSocket, ICMP_ECHO_REPLY, normalize_cipher_name
 HELLO_PREFIX = b"IDTS-KEX1\0"
 SESSION_PREFIX = b"IDTS-SESSION1\0"
 VIDEO_USER_AGENT = "IDTS Video Mode"
-DEFAULT_IDTS_DATA_PAYLOAD = 198
+DEFAULT_IDTS_DATA_PAYLOAD = 512
 
 
 @dataclass
@@ -128,7 +128,8 @@ def main() -> None:
     )
     ap.add_argument("--window", type=int, default=512)
     ap.add_argument("--rto", type=float, default=0.25)
-    ap.add_argument("--max-data-payload", type=int, default=DEFAULT_IDTS_DATA_PAYLOAD, help="Per-packet IDTS data payload size; keep this small for ICMP paths (default: 198)")
+    ap.add_argument("--max-data-payload", type=int, default=DEFAULT_IDTS_DATA_PAYLOAD, help="Per-packet IDTS data payload size; balanced default is 512 for ICMP paths")
+    ap.add_argument("--no-bpf", action="store_true", help="Disable the optional Linux classic BPF receive filter on the raw ICMP socket")
     ap.add_argument("--loss", type=int, default=0, help="Simulated outbound packet loss percent (0-100)")
     ap.add_argument("--congestion-control", action="store_true", help="Enable optional AIMD congestion control")
     ap.add_argument("--burst-limit", type=int, default=6, help="Max packets sent per flush cycle")
@@ -146,7 +147,7 @@ def main() -> None:
     maybe_regen_host_key(args.host_key_file, args.regen_key)
     host_private = load_or_create_host_key(args.host_key_file)
     host_public = public_bytes(host_private.public_key())
-    sock = AEADICMPSocket(raw_sock, cipher_name=selected_cipher or "chacha20", icmp_type=ICMP_ECHO_REPLY, icmp_id=args.bind_id or None)
+    sock = AEADICMPSocket(raw_sock, cipher_name=selected_cipher or "chacha20", icmp_type=ICMP_ECHO_REPLY, icmp_id=args.bind_id or None, enable_bpf=not args.no_bpf)
     sock.bind((args.bind_ip, args.bind_id))
     sessions: dict[tuple[str, int], ClientSession] = {}
     sessions_lock = threading.Lock()
