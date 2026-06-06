@@ -135,8 +135,8 @@ python3 server.py \
 ## ICMP socket path
 - transport stays on **raw ICMP**
 - small send/receive batches are used to reduce syscall overhead
-- Linux socket filters are enabled in Python when available so the raw socket wakes userspace less often on unrelated ICMP traffic
-- use `--no-bpf` if you want to test the raw ICMP path without the optional classic BPF filter
+- Linux classic BPF filtering is available as an optional feature for the raw ICMP socket
+- use `--bpf` only if you want to test that filter on your kernel/path; it is not the default because raw ICMP behavior varies a lot across environments
 
 ## Client example
 ```bash

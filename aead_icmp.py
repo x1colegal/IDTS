@@ -55,7 +55,7 @@ def _checksum(data: bytes) -> int:
 
 
 class AEADICMPSocket:
-    def __init__(self, sock: socket.socket, psk: str | bytes | None = None, cipher_name: str = "chacha20", icmp_type: int = ICMP_ECHO_REQUEST, icmp_id: int | None = None, enable_bpf: bool = True):
+    def __init__(self, sock: socket.socket, psk: str | bytes | None = None, cipher_name: str = "chacha20", icmp_type: int = ICMP_ECHO_REQUEST, icmp_id: int | None = None, enable_bpf: bool = False):
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 
         self.sock = sock

@@ -129,7 +129,7 @@ def main() -> None:
     ap.add_argument("--window", type=int, default=512)
     ap.add_argument("--rto", type=float, default=0.25)
     ap.add_argument("--max-data-payload", type=int, default=DEFAULT_IDTS_DATA_PAYLOAD, help="Per-packet IDTS data payload size; balanced default is 512 for ICMP paths")
-    ap.add_argument("--no-bpf", action="store_true", help="Disable the optional Linux classic BPF receive filter on the raw ICMP socket")
+    ap.add_argument("--bpf", action="store_true", help="Enable the optional Linux classic BPF receive filter on the raw ICMP socket")
     ap.add_argument("--loss", type=int, default=0, help="Simulated outbound packet loss percent (0-100)")
     ap.add_argument("--congestion-control", action="store_true", help="Enable optional AIMD congestion control")
     ap.add_argument("--burst-limit", type=int, default=6, help="Max packets sent per flush cycle")
@@ -147,7 +147,7 @@ def main() -> None:
     maybe_regen_host_key(args.host_key_file, args.regen_key)
     host_private = load_or_create_host_key(args.host_key_file)
     host_public = public_bytes(host_private.public_key())
-    sock = AEADICMPSocket(raw_sock, cipher_name=selected_cipher or "chacha20", icmp_type=ICMP_ECHO_REPLY, icmp_id=args.bind_id or None, enable_bpf=not args.no_bpf)
+    sock = AEADICMPSocket(raw_sock, cipher_name=selected_cipher or "chacha20", icmp_type=ICMP_ECHO_REPLY, icmp_id=args.bind_id or None, enable_bpf=args.bpf)
     sock.bind((args.bind_ip, args.bind_id))
     sessions: dict[tuple[str, int], ClientSession] = {}
     sessions_lock = threading.Lock()
