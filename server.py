@@ -129,6 +129,9 @@ def main() -> None:
     ap.add_argument("--rto", type=float, default=0.25)
     ap.add_argument("--loss", type=int, default=0, help="Simulated outbound packet loss percent (0-100)")
     ap.add_argument("--congestion-control", action="store_true", help="Enable optional AIMD congestion control")
+    ap.add_argument("--burst-limit", type=int, default=6, help="Max packets sent per flush cycle")
+    ap.add_argument("--pacing-ms", type=float, default=3.0, help="Delay between packets inside the same send burst")
+    ap.add_argument("--max-pending-outbound", type=int, default=768, help="Max queued+inflight outbound packets before backpressure")
     ap.add_argument("--cipher", default="auto", help="auto | chacha20 | aes-256-gcm | aes-128-gcm")
     ap.add_argument("--host-key-file", default=os.path.expanduser("~/.idts_host_key"))
     ap.add_argument("--regen-key", action="store_true", help="Regenerate the persistent server host key after interactive confirmation")
@@ -167,6 +170,9 @@ def main() -> None:
             rto=args.rto,
             loss_percent=args.loss,
             congestion_control=args.congestion_control,
+            burst_limit=args.burst_limit,
+            pacing_interval=args.pacing_ms / 1000.0,
+            max_pending=args.max_pending_outbound,
         )
         sender.start()
         print(f"[IDTS-SERVER] client joined {addr[0]}:id={addr[1]} cipher={cipher}")

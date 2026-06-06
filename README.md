@@ -61,6 +61,15 @@ Because of that, `IDTS` can be:
 
 If the network rate-limits ICMP aggressively, speeds can become extremely low even when the same path performs well with UDP.
 
+## ICMP tuning defaults
+The current defaults are intentionally conservative to reduce ICMP burstiness:
+- client keepalive is slower than the UDP-based USTPS defaults
+- sender pacing is enabled
+- send bursts are smaller
+- outbound queues are bounded more aggressively
+
+This is not because ICMP is inherently better at low speed, but because many real networks penalize bursty ICMP much more aggressively than bursty UDP.
+
 ## IDTS vs USTPS
 - `USTPS`:
   - transport: UDP

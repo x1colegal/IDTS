@@ -16,13 +16,27 @@ class SentItem:
 
 
 class USTPSender:
-    def __init__(self, sock: socket.socket, peer: Tuple[str, int], window: int = 512, rto: float = 0.25, loss_percent: int = 0, congestion_control: bool = False):
+    def __init__(
+        self,
+        sock: socket.socket,
+        peer: Tuple[str, int],
+        window: int = 512,
+        rto: float = 0.25,
+        loss_percent: int = 0,
+        congestion_control: bool = False,
+        burst_limit: int = 6,
+        pacing_interval: float = 0.003,
+        max_pending: int = 768,
+    ):
         self.sock = sock
         self.peer = peer
         self.window = window
         self.rto = rto
         self.loss_percent = max(0, min(100, loss_percent))
         self.congestion_control = congestion_control
+        self.burst_limit = max(1, burst_limit)
+        self.pacing_interval = max(0.0, pacing_interval)
+        self.max_pending = max(self.window, max_pending)
 
         self.next_seq = 1
         self.next_stream_pos = 0
@@ -69,8 +83,16 @@ class USTPSender:
     def queue_payload(self, payload: bytes, stream_pos: Optional[int] = None) -> None:
         if not payload:
             return
-        with self.lock:
-            self.pending.append((payload, stream_pos))
+        while self.running:
+            with self.lock:
+                queued = len(self.pending) + len(self.sent)
+                if queued < self.max_pending:
+                    self.pending.append((payload, stream_pos))
+                    break
+            time.sleep(min(0.01, max(self.pacing_interval, 0.001)))
+        else:
+            with self.lock:
+                self.pending.append((payload, stream_pos))
         self.wakeup.set()
 
     def _send_raw(self, raw: bytes) -> None:
@@ -86,7 +108,7 @@ class USTPSender:
 
     def flush(self) -> None:
         burst = 0
-        while burst < 64:
+        while burst < self.burst_limit:
             with self.lock:
                 in_flight = len(self.sent)
                 eff_window = self.window
@@ -125,6 +147,8 @@ class USTPSender:
             with self.lock:
                 self.last_send_ts = now
             burst += 1
+            if self.pacing_interval > 0.0 and burst < self.burst_limit:
+                time.sleep(self.pacing_interval)
 
     def _pump_loop(self) -> None:
         while self.running:

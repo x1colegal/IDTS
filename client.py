@@ -91,7 +91,7 @@ def main() -> None:
     ap.add_argument("--udp-port", type=int, default=1238)
     ap.add_argument("--udp-unordered-live", action="store_true", help="Immediate out-of-order UDP output (may corrupt generic players)")
     ap.add_argument("--reorder-buffer-ms", type=int, default=350, help="Initial local playout buffer delay for TCP output or ordered UDP mode")
-    ap.add_argument("--keepalive-interval", type=float, default=0.12)
+    ap.add_argument("--keepalive-interval", type=float, default=0.5, help="ICMP keepalive interval; higher values reduce ICMP control chatter")
     ap.add_argument("--cipher", default="chacha20", help="chacha20 | aes-256-gcm | aes-128-gcm")
     ap.add_argument("--tofu-file", default=os.path.expanduser("~/.idts_known_hosts.json"))
     ap.add_argument("--regen-key", action="store_true", help="Allow replacing a stored TOFU server key after interactive confirmation")
@@ -188,7 +188,7 @@ def main() -> None:
         while running:
             if session_ready:
                 recv.maybe_nack()
-            time.sleep(0.03)
+            time.sleep(0.08)
 
     def recv_loop() -> None:
         nonlocal next_out_pos, last_gap_log, last_rx_ts, last_valid_data_ts, session_ready
