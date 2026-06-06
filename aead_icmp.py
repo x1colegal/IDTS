@@ -125,17 +125,18 @@ class AEADICMPSocket:
         # Classic BPF: accept only ICMP echo request/reply. This reduces userspace
         # wakeups on noisy hosts while keeping the transport raw-ICMP based.
         try:
-            extended = (SockFilter * 8)(
+            extended = (SockFilter * 9)(
                 SockFilter(0x30, 0, 0, 0),                    # ld  b [0]   -> IP version/IHL
                 SockFilter(0x54, 0, 0, 0x0F),                 # and #0x0f   -> IHL in 32-bit words
                 SockFilter(0x64, 0, 0, 2),                    # lsh #2      -> IHL bytes
+                SockFilter(0x07, 0, 0, 0),                    # tax         -> X = IHL bytes
                 SockFilter(0x50, 0, 0, 0),                    # ldb [x+0]   -> ICMP type
                 SockFilter(0x15, 1, 0, ICMP_ECHO_REQUEST),    # if echo-request -> accept
                 SockFilter(0x15, 0, 1, ICMP_ECHO_REPLY),      # if echo-reply   -> accept else drop
                 SockFilter(0x06, 0, 0, 0x00040000),           # ret #262144
                 SockFilter(0x06, 0, 0, 0),                    # ret #0
             )
-            prog = SockFprog(len=8, filter=ctypes.cast(extended, ctypes.POINTER(SockFilter)))
+            prog = SockFprog(len=9, filter=ctypes.cast(extended, ctypes.POINTER(SockFilter)))
             self._bpf_program = extended
             self._bpf_prog = prog
             self.sock.setsockopt(socket.SOL_SOCKET, SO_ATTACH_FILTER, bytes(prog))
