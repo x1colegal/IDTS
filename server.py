@@ -1,0 +1,370 @@
+import argparse
+import os
+import shlex
+import socket
+import subprocess
+import threading
+import time
+import traceback
+from dataclasses import dataclass
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+from packet import MAX_PAYLOAD, TYPE_ACK, TYPE_HELLO, TYPE_RETRANSMIT_REQUEST, mkp
+from ustp import USTPSender, parse_packet
+from aead_icmp import AEADICMPSocket, ICMP_ECHO_REPLY, normalize_cipher_name
+HELLO_PREFIX = b"IDTS-KEX1\0"
+SESSION_PREFIX = b"IDTS-SESSION1\0"
+VIDEO_USER_AGENT = "IDTS Video Mode"
+
+
+@dataclass
+class ClientSession:
+    addr: tuple[str, int]
+    sender: USTPSender
+    last_hello_ts: float
+    last_seen_ts: float
+    cipher: str
+    session_psk: bytes
+    client_pub: bytes
+    server_pub: bytes
+    session_reply: bytes
+    next_stream_pos: int = 0
+    created_ts: float = 0.0
+
+
+def public_bytes(pubkey) -> bytes:
+    return pubkey.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+
+
+def derive_session_key(shared: bytes, client_pub: bytes, server_pub: bytes) -> bytes:
+    return HKDF(
+        algorithm=SHA256(),
+        length=32,
+        salt=client_pub + server_pub,
+        info=b"IDTS-X25519-session-v1",
+    ).derive(shared)
+
+
+def parse_client_hello(payload: bytes) -> tuple[bytes, str | None] | None:
+    if not payload.startswith(HELLO_PREFIX):
+        return None
+    rest = payload[len(HELLO_PREFIX) :]
+    if len(rest) < 32:
+        return None
+    client_pub = rest[:32]
+    cipher = None
+    if len(rest) > 32:
+        try:
+            cipher = normalize_cipher_name(rest[32:].decode("ascii", "replace"))
+        except Exception:
+            cipher = None
+    return client_pub, cipher
+
+
+def load_or_create_host_key(path: str) -> x25519.X25519PrivateKey:
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        if len(raw) == 32:
+            return x25519.X25519PrivateKey.from_private_bytes(raw)
+    except FileNotFoundError:
+        pass
+    key = x25519.X25519PrivateKey.generate()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(key.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+    return key
+
+
+def create_new_host_key(path: str) -> x25519.X25519PrivateKey:
+    key = x25519.X25519PrivateKey.generate()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(key.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+    return key
+
+
+def maybe_regen_host_key(path: str, enabled: bool) -> None:
+    if not enabled:
+        return
+    if not os.isatty(0):
+        raise SystemExit("--regen-key requires interactive confirmation")
+    answer = input(f"Regenerate IDTS host key at {path}? Existing clients will see a TOFU mismatch. [y/N] ").strip().lower()
+    if answer not in ("y", "yes"):
+        raise SystemExit("IDTS host key regeneration cancelled")
+    create_new_host_key(path)
+    print(f"[IDTS-SERVER] regenerated host key at {path}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="IDTS Server: FFmpeg -> IDTS/ICMP")
+    ap.add_argument("--peer-id", type=int, default=0, help="Optional fixed client ICMP identifier; 0 = learn from HELLO source identifier")
+    ap.add_argument("--bind-ip", default="0.0.0.0")
+    ap.add_argument("--bind-id", type=int, default=0, help="Local ICMP identifier override; 0 = auto")
+    ap.add_argument("--video", required=True)
+    ap.add_argument(
+        "--video-parameters",
+        default="",
+        help="Optional ffmpeg parameters to use instead of the default '-c copy -mpegts_flags +resend_headers'",
+    )
+    ap.add_argument("--window", type=int, default=512)
+    ap.add_argument("--rto", type=float, default=0.25)
+    ap.add_argument("--loss", type=int, default=0, help="Simulated outbound packet loss percent (0-100)")
+    ap.add_argument("--congestion-control", action="store_true", help="Enable optional AIMD congestion control")
+    ap.add_argument("--cipher", default="auto", help="auto | chacha20 | aes-256-gcm | aes-128-gcm")
+    ap.add_argument("--host-key-file", default=os.path.expanduser("~/.idts_host_key"))
+    ap.add_argument("--regen-key", action="store_true", help="Regenerate the persistent server host key after interactive confirmation")
+    ap.add_argument("--stalled-progress-timeout", type=float, default=20.0, help="Drop a session if ACK progress stops for too long while queues keep growing")
+    ap.add_argument("--max-pending-packets", type=int, default=4096, help="Per-session pending queue hard limit before the session is considered stalled")
+    args = ap.parse_args()
+
+    raw_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    selected_cipher = None if args.cipher == "auto" else normalize_cipher_name(args.cipher)
+    maybe_regen_host_key(args.host_key_file, args.regen_key)
+    host_private = load_or_create_host_key(args.host_key_file)
+    host_public = public_bytes(host_private.public_key())
+    sock = AEADICMPSocket(raw_sock, cipher_name=selected_cipher or "chacha20", icmp_type=ICMP_ECHO_REPLY, icmp_id=args.bind_id or None)
+    sock.bind((args.bind_ip, args.bind_id))
+    sessions: dict[tuple[str, int], ClientSession] = {}
+    sessions_lock = threading.Lock()
+
+    print(
+        f"[IDTS-SERVER] listen={args.bind_ip} icmp-id={sock.getsockname()[1]} "
+        f"cc={'on' if args.congestion_control else 'off'} default-aead={selected_cipher or 'auto'} multi-client=on"
+    )
+
+    running = True
+
+    def new_session(addr: tuple[str, int], client_pub_raw: bytes, requested_cipher: str | None) -> ClientSession:
+        cipher = selected_cipher or requested_cipher or "chacha20"
+        client_pub = x25519.X25519PublicKey.from_public_bytes(client_pub_raw)
+        session_psk = derive_session_key(host_private.exchange(client_pub), client_pub_raw, host_public)
+        session_reply = SESSION_PREFIX + client_pub_raw + host_public + cipher.encode("ascii")
+        sock.send_plain(mkp(TYPE_HELLO, payload=session_reply).to_bytes(), addr)
+        sock.set_peer_psk(addr, session_psk, cipher)
+        sender = USTPSender(
+            sock=sock,
+            peer=addr,
+            window=args.window,
+            rto=args.rto,
+            loss_percent=args.loss,
+            congestion_control=args.congestion_control,
+        )
+        sender.start()
+        print(f"[IDTS-SERVER] client joined {addr[0]}:id={addr[1]} cipher={cipher}")
+        now = time.time()
+        return ClientSession(
+            addr=addr,
+            sender=sender,
+            last_hello_ts=now,
+            last_seen_ts=now,
+            cipher=cipher,
+            session_psk=session_psk,
+            client_pub=client_pub_raw,
+            server_pub=host_public,
+            session_reply=session_reply,
+            created_ts=now,
+        )
+
+    def find_session_by_client_pub(client_pub_raw: bytes) -> tuple[tuple[str, int], ClientSession] | tuple[None, None]:
+        for existing_addr, existing_session in sessions.items():
+            if existing_session.client_pub == client_pub_raw:
+                return existing_addr, existing_session
+        return None, None
+
+    def migrate_session(old_addr: tuple[str, int], new_addr: tuple[str, int], session: ClientSession) -> None:
+        if old_addr == new_addr:
+            return
+        sock.clear_peer(old_addr)
+        sock.set_peer_psk(new_addr, session.session_psk, session.cipher)
+        session.sender.peer = new_addr
+        session.addr = new_addr
+        sessions.pop(old_addr, None)
+        sessions[new_addr] = session
+        print(f"[IDTS-SERVER] client migrated {old_addr[0]}:id={old_addr[1]} -> {new_addr[0]}:id={new_addr[1]}")
+
+    def ctrl_loop() -> None:
+        nonlocal running
+        while running:
+            try:
+                raw, addr = sock.recvfrom(65535)
+            except Exception:
+                continue
+
+            try:
+                pkt = parse_packet(raw)
+                if not pkt:
+                    continue
+                if args.peer_id and addr[1] != args.peer_id:
+                    continue
+                session = None
+                create_pub = None
+                now = time.time()
+
+                with sessions_lock:
+                    session = sessions.get(addr)
+                    if pkt.pkt_type == TYPE_HELLO:
+                        parsed = parse_client_hello(pkt.payload)
+                        if parsed is not None:
+                            client_pub, requested_cipher = parsed
+                            if session is not None:
+                                session.last_hello_ts = now
+                                if client_pub == session.client_pub:
+                                    pass
+                                else:
+                                    create_pub = (client_pub, requested_cipher)
+                            else:
+                                old_addr, old_session = find_session_by_client_pub(client_pub)
+                                if old_session is not None:
+                                    migrate_session(old_addr, addr, old_session)
+                                    session = old_session
+                                    session.last_hello_ts = now
+                                    session.last_seen_ts = now
+                                else:
+                                    create_pub = (client_pub, requested_cipher)
+                        elif session is not None:
+                            session.last_hello_ts = now
+                            session.last_seen_ts = now
+                    elif session is not None:
+                        session.last_seen_ts = now
+
+                if create_pub is not None:
+                    new = new_session(addr, create_pub[0], create_pub[1])
+                    with sessions_lock:
+                        old = sessions.get(addr)
+                        if old is not None:
+                            old.sender.stop()
+                            sock.clear_peer(addr)
+                        sessions[addr] = new
+                    continue
+
+                if session is None:
+                    continue
+                if pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST, TYPE_HELLO):
+                    session.sender.on_control(pkt)
+            except Exception:
+                print("[IDTS-SERVER] control-loop error:")
+                traceback.print_exc()
+
+    threading.Thread(target=ctrl_loop, daemon=True).start()
+
+    ffmpeg_video_args = shlex.split(args.video_parameters) if args.video_parameters.strip() else [
+        "-c",
+        "copy",
+        "-mpegts_flags",
+        "+resend_headers",
+    ]
+    cmd = [
+        "ffmpeg",
+        "-re",
+        "-user_agent",
+        VIDEO_USER_AGENT,
+        "-i",
+        args.video,
+        *ffmpeg_video_args,
+        "-f",
+        "mpegts",
+        "-",
+    ]
+    print("[IDTS-SERVER]", " ".join(cmd))
+
+    proc = None
+    try:
+        while True:
+            if proc is None or proc.poll() is not None:
+                if proc is not None:
+                    print(f"[IDTS-SERVER] ffmpeg exited code={proc.returncode}, restarting in 1s")
+                    time.sleep(1.0)
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+
+            if proc.stdout is None:
+                time.sleep(0.2)
+                continue
+
+            chunk = proc.stdout.read(MAX_PAYLOAD)
+            if not chunk:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                proc = None
+                continue
+
+            now = time.time()
+            with sessions_lock:
+                snapshot = list(sessions.items())
+
+            for addr, session in snapshot:
+                try:
+                    stats = session.sender.get_stats()
+                    if stats["pending"] > args.max_pending_packets and stats["last_progress_age"] > args.stalled_progress_timeout:
+                        with sessions_lock:
+                            current = sessions.get(addr)
+                            if current is session:
+                                session.sender.stop()
+                                sock.clear_peer(addr)
+                                del sessions[addr]
+                                print(
+                                    f"[IDTS-SERVER] stalled session removed {addr[0]}:id={addr[1]} "
+                                    f"pending={int(stats['pending'])} inflight={int(stats['inflight'])} "
+                                    f"last_progress={stats['last_progress_age']:.1f}s"
+                                )
+                        continue
+                    if (now - session.last_seen_ts) > 180.0:
+                        with sessions_lock:
+                            current = sessions.get(addr)
+                            if current is session:
+                                session.sender.stop()
+                                sock.clear_peer(addr)
+                                del sessions[addr]
+                                print(f"[IDTS-SERVER] client idle removed {addr[0]}:id={addr[1]} last_seen={now - session.last_seen_ts:.1f}s")
+                        continue
+                    stream_pos = session.next_stream_pos
+                    session.next_stream_pos += len(chunk)
+                    session.sender.queue_payload(chunk, stream_pos=stream_pos)
+                except Exception:
+                    print(f"[IDTS-SERVER] session send error {addr[0]}:id={addr[1]}:")
+                    traceback.print_exc()
+                    with sessions_lock:
+                        current = sessions.get(addr)
+                        if current is session:
+                            try:
+                                session.sender.stop()
+                                sock.clear_peer(addr)
+                            finally:
+                                sessions.pop(addr, None)
+    except KeyboardInterrupt:
+        print("[IDTS-SERVER] Interrupted")
+    finally:
+        running = False
+        with sessions_lock:
+            for session in sessions.values():
+                session.sender.stop()
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        time.sleep(0.2)
+
+
+if __name__ == "__main__":
+    main()
